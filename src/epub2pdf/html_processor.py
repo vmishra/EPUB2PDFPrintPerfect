@@ -8,12 +8,13 @@ import logging
 import re
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
+from urllib.parse import unquote
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 from PIL import Image
 
 if TYPE_CHECKING:
-    from .epub_parser import Chapter, EpubData
+    from .epub_parser import EpubData
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,10 @@ def _resolve_image_path(src: str, chapter_file: str) -> str:
     """Resolve a relative image path against the chapter's location in the EPUB."""
     if src.startswith(("http://", "https://", "data:")):
         return src
+    # Decode URL-encoded paths (e.g. %20 -> space)
+    src = unquote(src)
+    # Strip any fragment identifier (e.g. image.jpg#page=1)
+    src = src.split("#")[0]
     chapter_dir = str(PurePosixPath(chapter_file).parent)
     resolved = str(PurePosixPath(chapter_dir) / src)
     # Normalize ../ segments
@@ -99,8 +104,8 @@ def _resize_image_if_needed(image_data: bytes, media_type: str) -> tuple[bytes, 
 
     img = img.resize((new_w, new_h), Image.LANCZOS)
     buf = io.BytesIO()
-    # Convert RGBA to RGB for JPEG
-    if img.mode in ("RGBA", "P"):
+    # Convert any mode with alpha or palette to RGB for JPEG
+    if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
     return buf.getvalue(), "image/jpeg"
@@ -159,14 +164,6 @@ def embed_images(
         existing_style = img_tag.get("style", "")
         if "max-width" not in existing_style:
             img_tag["style"] = f"max-width:100%;height:auto;{existing_style}"
-
-
-def _extract_body_content(soup: BeautifulSoup) -> list[Tag]:
-    """Extract the children of <body>, or the whole soup if no body tag."""
-    body = soup.find("body")
-    if body:
-        return list(body.children)
-    return list(soup.children)
 
 
 def build_image_map(epub_data: EpubData) -> dict[str, tuple[bytes, str]]:
@@ -402,7 +399,8 @@ def _sanitize_epub_css(css: str) -> str:
     # Remove @page rules (we define our own)
     css = re.sub(r"@page\s*\{[^}]*\}", "", css)
     # Remove @font-face (fonts won't be available outside the EPUB)
-    css = re.sub(r"@font-face\s*\{[^}]*\}", "", css)
+    # Use dotall to handle multi-line blocks with url() containing special chars
+    css = re.sub(r"@font-face\s*\{[^}]*\}", "", css, flags=re.DOTALL)
     # Remove position:fixed/absolute on body
     css = re.sub(r"body\s*\{[^}]*position\s*:\s*(fixed|absolute)[^}]*\}", "", css)
     # Remove any width/height on body or html that would conflict
