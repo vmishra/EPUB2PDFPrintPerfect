@@ -178,21 +178,28 @@ def _extract_chapter_title(item: epub.EpubItem, fallback_order: int) -> str:
 
 
 def extract_images(book: epub.EpubBook) -> list[EpubImage]:
-    """Extract all images from the EPUB."""
+    """Extract all images from the EPUB, including cover images."""
     images: list[EpubImage] = []
-    for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-        try:
-            content = item.get_content()
-            if content:
-                images.append(
-                    EpubImage(
-                        file_name=item.get_name(),
-                        content=content,
-                        media_type=item.media_type,
+    seen: set[str] = set()
+    # ITEM_IMAGE (1) is regular images, ITEM_COVER (10) is cover image
+    for item_type in (ebooklib.ITEM_IMAGE, ebooklib.ITEM_COVER):
+        for item in book.get_items_of_type(item_type):
+            name = item.get_name()
+            if name in seen:
+                continue
+            seen.add(name)
+            try:
+                content = item.get_content()
+                if content:
+                    images.append(
+                        EpubImage(
+                            file_name=name,
+                            content=content,
+                            media_type=item.media_type,
+                        )
                     )
-                )
-        except Exception:
-            logger.warning("Failed to extract image: %s", item.get_name())
+            except Exception:
+                logger.warning("Failed to extract image: %s", name)
     logger.info("Extracted %d images", len(images))
     return images
 

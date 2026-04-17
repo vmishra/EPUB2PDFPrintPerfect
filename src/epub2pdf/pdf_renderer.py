@@ -98,7 +98,8 @@ def render_pdf(
 
     except Exception as e:
         tracker.finish()
-        raise RuntimeError(f"PDF rendering failed: {e}") from e
+        error_msg = str(e) if str(e) else type(e).__name__
+        raise RuntimeError(f"PDF rendering failed: {error_msg}") from e
 
     tracker.finish()
 

@@ -117,12 +117,14 @@ def embed_images(
     This embeds images directly into the HTML so WeasyPrint can render
     them without needing file system access to the EPUB contents.
     """
-    for img_tag in soup.find_all("img"):
+    # Handle both <img> and SVG <image> tags (xlink:href)
+    for img_tag in soup.find_all(["img", "image"]):
         if no_images:
             img_tag.decompose()
             continue
 
-        src = img_tag.get("src", "")
+        # Get src from either 'src', 'xlink:href', or 'href' attributes
+        src = img_tag.get("src") or img_tag.get("xlink:href") or img_tag.get("href", "")
         if not src or src.startswith("data:"):
             continue
 
@@ -139,7 +141,6 @@ def embed_images(
                     break
             if not found:
                 logger.warning("Image not found in EPUB: %s (from %s)", src, chapter_file)
-                # Replace with alt text or remove
                 alt = img_tag.get("alt", "[image]")
                 img_tag.replace_with(f"[{alt}]")
                 continue
@@ -148,7 +149,12 @@ def embed_images(
         img_data, img_media_type = _resize_image_if_needed(img_data, img_media_type)
 
         b64 = base64.b64encode(img_data).decode("ascii")
-        img_tag["src"] = f"data:{img_media_type};base64,{b64}"
+        data_uri = f"data:{img_media_type};base64,{b64}"
+        # Set the appropriate attribute based on tag type
+        if img_tag.name == "image":
+            img_tag["xlink:href"] = data_uri
+        else:
+            img_tag["src"] = data_uri
         # Ensure images scale within page
         existing_style = img_tag.get("style", "")
         if "max-width" not in existing_style:
