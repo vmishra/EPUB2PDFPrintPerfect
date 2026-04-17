@@ -6,12 +6,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
-
 from tqdm import tqdm
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
