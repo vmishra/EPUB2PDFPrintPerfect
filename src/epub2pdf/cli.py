@@ -91,11 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _setup_logging(verbose: bool, quiet: bool) -> None:
     level = logging.DEBUG if verbose else (logging.ERROR if quiet else logging.INFO)
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     root = logging.getLogger("epub2pdf")
     root.setLevel(level)
-    root.addHandler(handler)
+    # Avoid adding duplicate handlers on repeated calls
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        root.addHandler(handler)
 
 
 def _resolve_output_path(input_path: Path, output_arg: str | None) -> Path:
