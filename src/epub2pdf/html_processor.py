@@ -10,7 +10,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from PIL import Image
 
 if TYPE_CHECKING:
@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 MAX_IMAGE_DIMENSION = 1600
 # JPEG quality for resized images
 JPEG_QUALITY = 85
+
+# Pre-compiled regexes for inline style sanitization
+_RE_FLOAT = re.compile(r"float\s*:\s*[^;]+;?")
+_RE_POSITION = re.compile(r"position\s*:\s*(absolute|fixed)\s*;?")
+_RE_OVERFLOW_X = re.compile(r"overflow-x\s*:\s*[^;]+;?")
+
+# Tags to strip from EPUB HTML (not relevant to PDF output)
+_STRIP_TAGS_SELECTOR = (
+    "script, noscript, form, input, button, iframe, "
+    "video, audio, canvas, map, object, embed"
+)
 
 
 def clean_html(html_content: bytes, file_name: str) -> BeautifulSoup:
@@ -39,14 +50,11 @@ def clean_html(html_content: bytes, file_name: str) -> BeautifulSoup:
 
     soup = BeautifulSoup(html_str, "html.parser")
 
-    # Remove elements that don't belong in PDF output
-    for tag_name in ("script", "noscript", "form", "input", "button", "iframe",
-                     "video", "audio", "canvas", "map", "object", "embed"):
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
+    # Remove elements that don't belong in PDF output (single DOM pass)
+    for tag in soup.select(_STRIP_TAGS_SELECTOR):
+        tag.decompose()
 
-    # Remove comments
-    from bs4 import Comment
+    # Remove HTML comments
     for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
         comment.extract()
 
@@ -54,9 +62,9 @@ def clean_html(html_content: bytes, file_name: str) -> BeautifulSoup:
     # (these cause WeasyPrint assertion errors)
     for tag in soup.find_all(style=True):
         style = tag["style"]
-        style = re.sub(r"float\s*:\s*[^;]+;?", "", style)
-        style = re.sub(r"position\s*:\s*(absolute|fixed)\s*;?", "", style)
-        style = re.sub(r"overflow-x\s*:\s*[^;]+;?", "overflow:hidden;", style)
+        style = _RE_FLOAT.sub("", style)
+        style = _RE_POSITION.sub("", style)
+        style = _RE_OVERFLOW_X.sub("overflow:hidden;", style)
         if style.strip():
             tag["style"] = style
         else:
@@ -90,31 +98,35 @@ def _resize_image_if_needed(image_data: bytes, media_type: str) -> tuple[bytes, 
     """Resize an image if it exceeds MAX_IMAGE_DIMENSION. Returns (data, media_type)."""
     try:
         img = Image.open(io.BytesIO(image_data))
-    except Exception:
+    except (OSError, ValueError):
         return image_data, media_type
 
-    w, h = img.size
-    if w <= MAX_IMAGE_DIMENSION and h <= MAX_IMAGE_DIMENSION:
-        return image_data, media_type
+    try:
+        w, h = img.size
+        if w <= MAX_IMAGE_DIMENSION and h <= MAX_IMAGE_DIMENSION:
+            return image_data, media_type
 
-    ratio = min(MAX_IMAGE_DIMENSION / w, MAX_IMAGE_DIMENSION / h)
-    new_w = int(w * ratio)
-    new_h = int(h * ratio)
-    logger.debug("Resizing image from %dx%d to %dx%d", w, h, new_w, new_h)
+        ratio = min(MAX_IMAGE_DIMENSION / w, MAX_IMAGE_DIMENSION / h)
+        new_w = int(w * ratio)
+        new_h = int(h * ratio)
+        logger.debug("Resizing image from %dx%d to %dx%d", w, h, new_w, new_h)
 
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-    buf = io.BytesIO()
-    # Convert any mode with alpha or palette to RGB for JPEG
-    if img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
-    img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-    return buf.getvalue(), "image/jpeg"
+        resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        # Convert any mode with alpha or palette to RGB for JPEG
+        if resized.mode not in ("RGB", "L"):
+            resized = resized.convert("RGB")
+        buf = io.BytesIO()
+        resized.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        return buf.getvalue(), "image/jpeg"
+    finally:
+        img.close()
 
 
 def embed_images(
     soup: BeautifulSoup,
     chapter_file: str,
     image_map: dict[str, tuple[bytes, str]],
+    basename_map: dict[str, str],
     no_images: bool = False,
 ) -> None:
     """Replace image src attributes with base64 data URIs.
@@ -136,17 +148,13 @@ def embed_images(
         resolved = _resolve_image_path(src, chapter_file)
 
         if resolved not in image_map:
-            # Try without leading path components (some EPUBs use flat structure)
+            # O(1) fallback: try basename match (some EPUBs use flat structure)
             basename = PurePosixPath(resolved).name
-            found = False
-            for key in image_map:
-                if PurePosixPath(key).name == basename:
-                    resolved = key
-                    found = True
-                    break
-            if not found:
+            if basename in basename_map:
+                resolved = basename_map[basename]
+            else:
                 logger.warning("Image not found in EPUB: %s (from %s)", src, chapter_file)
-                alt = img_tag.get("alt", "[image]")
+                alt = img_tag.get("alt") or PurePosixPath(src).name
                 img_tag.replace_with(f"[{alt}]")
                 continue
 
@@ -166,9 +174,18 @@ def embed_images(
             img_tag["style"] = f"max-width:100%;height:auto;{existing_style}"
 
 
-def build_image_map(epub_data: EpubData) -> dict[str, tuple[bytes, str]]:
-    """Build a lookup dict of image file name -> (bytes, media_type)."""
-    return {img.file_name: (img.content, img.media_type) for img in epub_data.images}
+def build_image_map(
+    epub_data: EpubData,
+) -> tuple[dict[str, tuple[bytes, str]], dict[str, str]]:
+    """Build lookup dicts for image resolution.
+
+    Returns:
+        image_map: full path -> (bytes, media_type)
+        basename_map: filename only -> full path (for fallback lookups)
+    """
+    image_map = {img.file_name: (img.content, img.media_type) for img in epub_data.images}
+    basename_map = {PurePosixPath(k).name: k for k in image_map}
+    return image_map, basename_map
 
 
 def merge_chapters(
@@ -186,19 +203,20 @@ def merge_chapters(
     3. Merge all chapters with page-break separators
     4. Wrap in a complete HTML document with CSS for print layout
     """
-    image_map = build_image_map(epub_data)
+    image_map, basename_map = build_image_map(epub_data)
 
     # Collect original EPUB CSS
     epub_css = "\n".join(epub_data.css_files)
 
     # Build merged body
     body_parts: list[str] = []
+    skipped_empty = 0
 
     for i, chapter in enumerate(epub_data.chapters):
         logger.debug("Processing chapter %d/%d: %s", i + 1, len(epub_data.chapters), chapter.title)
 
         soup = clean_html(chapter.html_content, chapter.file_name)
-        embed_images(soup, chapter.file_name, image_map, no_images=no_images)
+        embed_images(soup, chapter.file_name, image_map, basename_map, no_images=no_images)
 
         # Extract body content
         body = soup.find("body")
@@ -208,6 +226,7 @@ def merge_chapters(
             inner_html = soup.decode_contents()
 
         if not inner_html.strip():
+            skipped_empty += 1
             continue
 
         # Wrap each chapter in a section with page-break
@@ -217,6 +236,9 @@ def merge_chapters(
             f"{inner_html}"
             f"</section>"
         )
+
+    if skipped_empty:
+        logger.debug("Skipped %d empty chapters", skipped_empty)
 
     merged_body = "\n".join(body_parts)
 
@@ -390,27 +412,30 @@ def _escape_html(text: str) -> str:
     )
 
 
+_RE_CSS_PAGE = re.compile(r"@page\s*\{[^}]*\}")
+_RE_CSS_FONT_FACE = re.compile(r"@font-face\s*\{[^}]*\}", re.DOTALL)
+_RE_CSS_BODY_POS = re.compile(
+    r"body\s*\{[^}]*position\s*:\s*(fixed|absolute)[^}]*\}"
+)
+_RE_CSS_ROOT_BLOCK = re.compile(r"(html|body)\s*\{[^}]*\}")
+_RE_CSS_FLOAT = re.compile(r"float\s*:\s*[^;]+;")
+_RE_CSS_OVERFLOW_X = re.compile(r"overflow-x\s*:\s*[^;]+;")
+_RE_CSS_ABS_FIXED = re.compile(r"position\s*:\s*(absolute|fixed)\s*;")
+
+
 def _sanitize_epub_css(css: str) -> str:
     """Sanitize EPUB CSS to avoid breaking the print layout.
 
     Removes @page rules, fixed positioning, float properties, and other
     problematic properties that conflict with WeasyPrint's print rendering.
     """
-    # Remove @page rules (we define our own)
-    css = re.sub(r"@page\s*\{[^}]*\}", "", css)
-    # Remove @font-face (fonts won't be available outside the EPUB)
-    # Use dotall to handle multi-line blocks with url() containing special chars
-    css = re.sub(r"@font-face\s*\{[^}]*\}", "", css, flags=re.DOTALL)
-    # Remove position:fixed/absolute on body
-    css = re.sub(r"body\s*\{[^}]*position\s*:\s*(fixed|absolute)[^}]*\}", "", css)
-    # Remove any width/height on body or html that would conflict
-    css = re.sub(r"(html|body)\s*\{[^}]*\}", _strip_dimension_props, css)
-    # Remove float properties globally (causes WeasyPrint assertion errors)
-    css = re.sub(r"float\s*:\s*[^;]+;", "", css)
-    # Remove overflow-x (unsupported in WeasyPrint)
-    css = re.sub(r"overflow-x\s*:\s*[^;]+;", "overflow: hidden;", css)
-    # Remove position:absolute/fixed everywhere
-    css = re.sub(r"position\s*:\s*(absolute|fixed)\s*;", "", css)
+    css = _RE_CSS_PAGE.sub("", css)
+    css = _RE_CSS_FONT_FACE.sub("", css)
+    css = _RE_CSS_BODY_POS.sub("", css)
+    css = _RE_CSS_ROOT_BLOCK.sub(_strip_dimension_props, css)
+    css = _RE_CSS_FLOAT.sub("", css)
+    css = _RE_CSS_OVERFLOW_X.sub("overflow: hidden;", css)
+    css = _RE_CSS_ABS_FIXED.sub("", css)
     return css
 
 
