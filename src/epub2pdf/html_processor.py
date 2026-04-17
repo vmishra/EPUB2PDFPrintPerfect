@@ -36,7 +36,7 @@ def clean_html(html_content: bytes, file_name: str) -> BeautifulSoup:
         logger.debug("UTF-8 decode failed for %s, trying latin-1", file_name)
         html_str = html_content.decode("latin-1", errors="replace")
 
-    soup = BeautifulSoup(html_str, "lxml")
+    soup = BeautifulSoup(html_str, "html.parser")
 
     # Remove elements that don't belong in PDF output
     for tag_name in ("script", "noscript", "form", "input", "button", "iframe",
@@ -48,6 +48,18 @@ def clean_html(html_content: bytes, file_name: str) -> BeautifulSoup:
     from bs4 import Comment
     for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
         comment.extract()
+
+    # Strip float and position:absolute/fixed from inline styles
+    # (these cause WeasyPrint assertion errors)
+    for tag in soup.find_all(style=True):
+        style = tag["style"]
+        style = re.sub(r"float\s*:\s*[^;]+;?", "", style)
+        style = re.sub(r"position\s*:\s*(absolute|fixed)\s*;?", "", style)
+        style = re.sub(r"overflow-x\s*:\s*[^;]+;?", "overflow:hidden;", style)
+        if style.strip():
+            tag["style"] = style
+        else:
+            del tag["style"]
 
     return soup
 
@@ -285,7 +297,7 @@ def merge_chapters(
 
     pre {{
         padding: 1em;
-        overflow-x: auto;
+        overflow: hidden;
         white-space: pre-wrap;
         word-wrap: break-word;
         page-break-inside: avoid;
@@ -378,8 +390,8 @@ def _escape_html(text: str) -> str:
 def _sanitize_epub_css(css: str) -> str:
     """Sanitize EPUB CSS to avoid breaking the print layout.
 
-    Removes @page rules, fixed positioning, and other problematic properties
-    that would conflict with our print stylesheet.
+    Removes @page rules, fixed positioning, float properties, and other
+    problematic properties that conflict with WeasyPrint's print rendering.
     """
     # Remove @page rules (we define our own)
     css = re.sub(r"@page\s*\{[^}]*\}", "", css)
@@ -389,6 +401,12 @@ def _sanitize_epub_css(css: str) -> str:
     css = re.sub(r"body\s*\{[^}]*position\s*:\s*(fixed|absolute)[^}]*\}", "", css)
     # Remove any width/height on body or html that would conflict
     css = re.sub(r"(html|body)\s*\{[^}]*\}", _strip_dimension_props, css)
+    # Remove float properties globally (causes WeasyPrint assertion errors)
+    css = re.sub(r"float\s*:\s*[^;]+;", "", css)
+    # Remove overflow-x (unsupported in WeasyPrint)
+    css = re.sub(r"overflow-x\s*:\s*[^;]+;", "overflow: hidden;", css)
+    # Remove position:absolute/fixed everywhere
+    css = re.sub(r"position\s*:\s*(absolute|fixed)\s*;", "", css)
     return css
 
 
