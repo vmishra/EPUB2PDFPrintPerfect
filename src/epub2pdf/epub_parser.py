@@ -94,7 +94,7 @@ def _get_metadata_field(book: epub.EpubBook, field_name: str) -> str:
         if values:
             return str(values[0][0])
     except (IndexError, KeyError, TypeError):
-        pass
+        logger.debug("Metadata field '%s' not found", field_name)
     return "Unknown"
 
 
@@ -198,8 +198,8 @@ def extract_images(book: epub.EpubBook) -> list[EpubImage]:
                             media_type=item.media_type,
                         )
                     )
-            except Exception:
-                logger.warning("Failed to extract image: %s", name)
+            except (KeyError, OSError, AttributeError) as e:
+                logger.warning("Failed to extract image: %s (%s)", name, e)
     logger.info("Extracted %d images", len(images))
     return images
 
@@ -213,8 +213,8 @@ def extract_css(book: epub.EpubBook) -> list[str]:
             if content:
                 css_text = content.decode("utf-8", errors="replace")
                 css_files.append(css_text)
-        except Exception:
-            logger.warning("Failed to extract CSS: %s", item.get_name())
+        except (KeyError, OSError, UnicodeDecodeError) as e:
+            logger.warning("Failed to extract CSS: %s (%s)", item.get_name(), e)
     logger.debug("Extracted %d CSS files", len(css_files))
     return css_files
 
