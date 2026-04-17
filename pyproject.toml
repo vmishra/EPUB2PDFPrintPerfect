@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "epub2pdf"
+version = "1.0.0"
+description = "Production-grade EPUB to PDF converter with high-quality formatting"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Vikas"}]
+dependencies = [
+    "ebooklib>=0.18",
+    "beautifulsoup4>=4.12",
+    "lxml>=4.9",
+    "weasyprint>=62.0",
+    "Pillow>=10.0",
+    "tqdm>=4.66",
+]
+
+[project.scripts]
+epub2pdf = "epub2pdf.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
